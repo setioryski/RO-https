@@ -8,6 +8,7 @@ const util = require('util');
 const rateLimit = require('express-rate-limit');
 const dashboardRoutes = require('./routes/dashboard');
 const pool = require('./config/db');
+const fs = require('fs').promises;
 const { isAuthenticated, checkRole } = require('./authMiddleware');
 
 const app = express();
@@ -163,49 +164,60 @@ app.post('/upload', isAuthenticated, checkRole(['admin', 'petugas']), upload.sin
         return res.status(400).json({ success: false, message: 'Missing required fields.' });
     }
 
+    const resizedImagePath = `uploads/resized-${req.file.filename}`;
+
     try {
-        // Process and resize the uploaded image
-        const resizedImagePath = `uploads/resized-${req.file.filename}`;
-        await sharp(req.file.path)
-            .rotate()
+        // Perform image processing and database insertion in parallel
+        const processImage = sharp(req.file.path)
+            .rotate()  // Optional: Remove this if rotation is not needed
             .resize(800)
-            .jpeg({ quality: 70 })
+            .jpeg({ quality: 70 })  // Adjust the quality as needed
             .toFile(resizedImagePath);
 
-        // SQL query to insert data into the database
-        const query = `
-            INSERT INTO aset (
-                foto, id_kondisi, catatan, id_user, id_tipe_lantai, id_department, target_completion_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `;
-        const queryValues = [
-            resizedImagePath, 
-            id_kondisi, 
-            catatan, 
-            id_user,
-            id_tipe_lantai,
-            id_department, 
-            target_completion_date || null
-        ];
+        const insertToDatabase = new Promise((resolve, reject) => {
+            const query = `
+                INSERT INTO aset (
+                    foto, id_kondisi, catatan, id_user, id_tipe_lantai, id_department, target_completion_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `;
+            const queryValues = [
+                resizedImagePath, 
+                id_kondisi, 
+                catatan, 
+                id_user,
+                id_tipe_lantai,
+                id_department, 
+                target_completion_date || null
+            ];
 
-        pool.query(query, queryValues, (err, result) => {
-            if (err) {
-                console.error('Failed to insert into database:', err);
-                deleteFileWithRetry(resizedImagePath); // Cleanup resized file on failure
-                return res.status(500).json({ success: false, message: 'Database insertion failed.' });
-            }
-
-            // Cleanup original file after successful processing
-            deleteFileWithRetry(req.file.path);
-            return res.status(200).json({ success: true, message: 'Form submitted successfully!' });
+            pool.query(query, queryValues, (err, result) => {
+                if (err) {
+                    console.error('Failed to insert into database:', err);
+                    return reject(new Error('Database insertion failed.'));
+                }
+                resolve(result);
+            });
         });
+
+        await Promise.all([processImage, insertToDatabase]);
+
+        // Clean up the original file asynchronously
+        fs.unlink(req.file.path)
+            .catch(err => console.error('Failed to delete original file:', err));
+
+        return res.status(200).json({ success: true, message: 'Form submitted successfully!' });
 
     } catch (error) {
         console.error('Error during processing:', error);
-        deleteFileWithRetry(req.file.path); // Cleanup original file even on failure
+
+        // Clean up both original and resized files asynchronously on error
+        await fs.unlink(req.file.path).catch(err => console.error('Failed to delete original file:', err));
+        await fs.unlink(resizedImagePath).catch(err => console.error('Failed to delete resized file:', err));
+
         return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
     }
 });
+
 
 
 
